@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Unified AI Chat</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 0;
+      background: #f0f0f0;
+    }
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #fff;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      border-radius: 8px;
+      margin-top: 40px;
+    }
+    h1 {
+      text-align: center;
+    }
+    #chat-box {
+      border: 1px solid #ccc;
+      height: 400px;
+      overflow-y: scroll;
+      padding: 10px;
+      margin-bottom: 10px;
+      white-space: pre-wrap;
+    }
+    .message.user {
+      color: #333;
+      margin-bottom: 10px;
+    }
+    .message.ai {
+      color: #007bff;
+      margin-bottom: 10px;
+    }
+    #input-area {
+      display: flex;
+      gap: 10px;
+    }
+    #model-select {
+      padding: 6px;
+    }
+    #message-input {
+      flex: 1;
+      padding: 8px;
+    }
+    #send-btn {
+      padding: 8px 16px;
+      background: #007bff;
+      color: #fff;
+      border: none;
+      cursor: pointer;
+    }
+    #send-btn:disabled {
+      background: #aaa;
+      cursor: default;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Unified AI Chat</h1>
+    <div id="chat-box"></div>
+    <div id="input-area">
+      <select id="model-select">
+        <option value="openai">ChatGPT (OpenAI)</option>
+        <option value="gemini">Gemini (Google)</option>
+        <option value="xai">Grok (xAI)</option>
+      </select>
+      <input type="text" id="message-input" placeholder="Type your message...">
+      <button id="send-btn">Send</button>
+    </div>
+  </div>
+  <script>
+    const chatBox = document.getElementById('chat-box');
+    const messageInput = document.getElementById('message-input');
+    const sendBtn = document.getElementById('send-btn');
+    const modelSelect = document.getElementById('model-select');
+    // Maintain conversation history
+    let messages = [];
+
+    function appendMessage(role, content) {
+      const div = document.createElement('div');
+      div.classList.add('message');
+      div.classList.add(role === 'user' ? 'user' : 'ai');
+      div.textContent = (role === 'user' ? 'You: ' : 'AI: ') + content;
+      chatBox.appendChild(div);
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    async function sendMessage() {
+      const content = messageInput.value.trim();
+      if (!content) return;
+      // Append user message
+      appendMessage('user', content);
+      messages.push({ role: 'user', content });
+      messageInput.value = '';
+      sendBtn.disabled = true;
+      const provider = modelSelect.value;
+      try {
+        const response = await fetch('/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ provider, messages })
+        });
+        if (!response.ok) {
+          const errorData = await response.json();
+          appendMessage('ai', `[Error ${response.status}]: ${errorData.detail || 'Unknown error'}`);
+          return;
+        }
+        const data = await response.json();
+        const aiContent = data.content;
+        appendMessage('ai', aiContent);
+        // Append assistant message to history for context
+        messages.push({ role: 'assistant', content: aiContent });
+      } catch (err) {
+        appendMessage('ai', `Error: ${err.message}`);
+      } finally {
+        sendBtn.disabled = false;
+      }
+    }
+
+    sendBtn.addEventListener('click', sendMessage);
+    messageInput.addEventListener('keydown', function(evt) {
+      if (evt.key === 'Enter' && !evt.shiftKey) {
+        evt.preventDefault();
+        sendMessage();
+      }
+    });
+  </script>
+</body>
+</html>
