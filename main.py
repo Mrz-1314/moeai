@@ -1,181 +1,245 @@
-"""
-Simple FastAPI application that exposes a unified chat endpoint for
-multiple AI providers (OpenAI GPT‑4o, Google Gemini and xAI Grok).
+# main.py
+# FastAPI 后端：统一接入 OpenAI(ChatGPT)、Google Gemini、xAI Grok
+# - /         ：返回 index.html
+# - /chat     ：{ provider: "openai"|"gemini"|"xai"|"auto", messages: [...] }
+# 说明：
+# 1) 不强制安装各家 SDK，全部用 requests 直连官方 REST API，Vercel/Docker 更稳。
+# 2) 环境变量：OPENAI_API_KEY / GEMINI_API_KEY / XAI_API_KEY
+# 3) 简单 MoE 路由：provider=auto 时按启发式分发；你可自行完善 route_request()
 
-The routing logic is simple: the client specifies which provider to
-use via the `provider` field. This is a proof‑of‑concept implementation
-and does not include advanced MoE routing – you can extend the logic
-in the `route_request` function.
-
-Environment variables expected (see README for details):
-
-    OPENAI_API_KEY    – API key for OpenAI (ChatGPT / GPT‑4o).
-    GEMINI_API_KEY    – API key for Google Gemini.
-    XAI_API_KEY       – API key for xAI Grok.
-
-Run this service with uvicorn:
-
-    uvicorn main:app --reload --port 8000
-
-Then open http://localhost:8000 in your browser to access the basic
-chat UI.
-"""
-
+from __future__ import annotations
 import os
-import json
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+import re
+from typing import List, Optional, Dict, Any
+
+import requests
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from dotenv import load_dotenv
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
-# Third‑party clients
-# Optional imports: these modules may not be installed in all environments.
-try:
-    import openai  # type: ignore
-except Exception:
-    openai = None  # type: ignore
+# ------------ 配置 ------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+XAI_API_KEY = os.getenv("XAI_API_KEY", "").strip()
 
-import requests  # requests is part of the base environment
+# 默认模型（可在 /chat 请求里覆盖）
+DEFAULT_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro-preview-06-05")
+DEFAULT_XAI_MODEL = os.getenv("XAI_MODEL", "grok-3")
 
-try:
-    import google.generativeai as genai  # type: ignore
-except Exception:
-    genai = None  # type: ignore
+# ------------ FastAPI 基础 ------------
+app = FastAPI(title="Unified AI Chat (MoE Router)")
 
-# Load environment variables from .env if present
-load_dotenv()
-
-# Configure OpenAI and Gemini clients
-openai.api_key = os.getenv("OPENAI_API_KEY")
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-XAI_API_KEY = os.getenv("XAI_API_KEY")
-
-
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-
-
-class ChatRequest(BaseModel):
-    provider: str
-    messages: list[ChatMessage]
-
-
-app = FastAPI(title="Unified AI Chat Service")
-
+# CORS（前后端分离时把 "*" 换成你的域名）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For simplicity; adjust for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-def call_openai(messages: list[ChatMessage]) -> str:
-    """Call the OpenAI Chat Completion API with GPT‑4o and return the first message."""
-    # If the openai package is not available, return a placeholder message
-    if openai is None:
-        return "OpenAI SDK is not installed in this environment."
-    if not openai.api_key:
-        # If no API key is configured, return a helpful placeholder
-        return "OpenAI API key is not configured on the server."
-    try:
-        response = openai.chat.completions.create(
-            model="gpt-4o",
-            messages=[m.dict() for m in messages],
-            temperature=0.7,
-        )
-        return response.choices[0].message.content
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+# 静态/首页（Docker 部署时可直接用）
+app.mount("/static", StaticFiles(directory="."), name="static")
 
 
-def call_gemini(messages: list[ChatMessage]) -> str:
-    """Call the Gemini API and return the generated content."""
-    # If the generativeai SDK is not available or no API key is configured, return placeholder
-    if genai is None:
-        return "Google Gemini SDK is not installed in this environment."
-    if not os.getenv("GEMINI_API_KEY"):
-        return "Gemini API key is not configured on the server."
-    try:
-        # The Gemini SDK expects a flat list of contents. We'll join user
-        # and assistant messages into a single prompt separated by newlines.
-        # Note: This is a simplified example; for more complex contexts
-        # you may want to structure the prompt differently.
-        prompt = "\n".join(m.content for m in messages)
-        client = genai.Client()
-        # Use the preview model; adjust as needed
-        result = client.models.generate_content(
-            model="gemini-2.5-pro-preview-06-05",
-            contents=prompt
-        )
-        return result.text
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+@app.get("/")
+def root():
+    # 如果你的 index.html 在根目录，这里会正常返回
+    if os.path.exists("index.html"):
+        return FileResponse("index.html")
+    return JSONResponse({"ok": True, "msg": "index.html not found in project root"})
 
 
-def call_xai(messages: list[ChatMessage]) -> str:
-    """Call the xAI Grok API using a simple HTTP request."""
-    if not XAI_API_KEY:
-        # If no key configured, return placeholder text
-        return "xAI API key is not configured on the server."
-    url = "https://api.x.ai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {XAI_API_KEY}",
-        "Content-Type": "application/json",
+@app.get("/healthz")
+def healthz():
+    return {
+        "ok": True,
+        "openai": bool(OPENAI_API_KEY),
+        "gemini": bool(GEMINI_API_KEY),
+        "xai": bool(XAI_API_KEY),
     }
-    data = {
-        "model": "grok-3-beta",
+
+
+# ------------ 数据模型 ------------
+class ChatMessage(BaseModel):
+    role: str = Field(..., description="user/assistant/system")
+    content: str
+
+
+class ChatRequest(BaseModel):
+    provider: str = Field(..., description='"openai"|"gemini"|"xai"|"auto"')
+    messages: List[ChatMessage]
+    model: Optional[str] = None
+    temperature: Optional[float] = 0.7
+    max_tokens: Optional[int] = 1500
+
+
+# ------------ 路由器（简易 MoE） ------------
+TIME_WORDS = ("今天", "刚刚", "最新", "实时", "news", "today", "now", "current", "breaking")
+MEDIA_WORDS = ("图片", "截图", "视频", "图像", "image", "photo", "video", "vision")
+CODE_WORDS = ("def ", "class ", "console.log", "Exception", "Traceback", "SELECT ", "INSERT ", "{", "};")
+
+def route_request(messages: List[ChatMessage]) -> str:
+    """非常简单的启发式路由：可按你业务继续加强"""
+    text = " \n".join(m.content for m in messages[-3:]).lower()
+    # 含媒体/多模态→Gemini
+    if any(w.lower() in text for w in MEDIA_WORDS):
+        return "gemini"
+    # 强时效→Grok
+    if any(w.lower() in text for w in TIME_WORDS):
+        return "xai"
+    # 代码/结构化→OpenAI
+    if any(w.lower() in text for w in CODE_WORDS):
+        return "openai"
+    # 默认：OpenAI
+    return "openai"
+
+
+# ------------ Provider 适配：HTTP 直连 ------------
+def call_openai(messages: List[ChatMessage], model: Optional[str], temperature: float, max_tokens: int) -> str:
+    if not OPENAI_API_KEY:
+        return "OpenAI API key 未配置（OPENAI_API_KEY）。"
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": model or DEFAULT_OPENAI_MODEL,
         "messages": [m.dict() for m in messages],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
         "stream": False,
-        "temperature": 0.7,
     }
+    resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    data = resp.json()
     try:
-        resp = requests.post(url, headers=headers, json=data, timeout=60)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-        resp_json = resp.json()
-        return resp_json["choices"][0]["message"]["content"]
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        return str(data)
 
 
-def route_request(provider: str, messages: list[ChatMessage]) -> str:
+def _gemini_convert_messages(messages: List[ChatMessage]) -> List[Dict[str, Any]]:
     """
-    Route the request to the appropriate provider based on the `provider` string.
-
-    Valid providers: "openai", "gemini", "xai".
-
-    Raises HTTPException for unsupported provider.
+    将 OpenAI 风格 messages 转为 Gemini REST 的 contents：
+    - Gemini 角色：user / model
+    - system 信息：拼到第一条 user 前面
     """
-    provider = provider.lower().strip()
-    if provider == "openai" or provider == "chatgpt":
-        return call_openai(messages)
-    elif provider == "gemini" or provider == "google":
-        return call_gemini(messages)
-    elif provider == "xai" or provider == "grok":
-        return call_xai(messages)
-    else:
-        raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
+    system_prompts = [m.content for m in messages if m.role == "system"]
+    sys_text = ("\n".join(system_prompts)).strip()
+    contents = []
+    for m in messages:
+        if m.role == "system":
+            continue
+        role = "user" if m.role == "user" else "model"
+        text = m.content
+        if role == "user" and sys_text:
+            text = f"[System]\n{sys_text}\n\n[User]\n{text}"
+            sys_text = ""  # 只拼一次
+        contents.append({"role": role, "parts": [{"text": text}]})
+    if not contents and sys_text:
+        contents.append({"role": "user", "parts": [{"text": f"[System]\n{sys_text}"}]})
+    return contents
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index() -> HTMLResponse:
-    """Serve the basic chat user interface."""
-    root = os.path.dirname(os.path.realpath(__file__))
-    html_path = os.path.join(root, "index.html")
-    with open(html_path, "r", encoding="utf-8") as f:
-        content = f.read()
-    return HTMLResponse(content)
+def call_gemini(messages: List[ChatMessage], model: Optional[str], temperature: float, max_tokens: int) -> str:
+    if not GEMINI_API_KEY:
+        return "Gemini API key 未配置（GEMINI_API_KEY）。"
+    use_model = model or DEFAULT_GEMINI_MODEL
+    # Gemini REST：v1beta
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{use_model}:generateContent?key={GEMINI_API_KEY}"
+    body = {
+        "contents": _gemini_convert_messages(messages),
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+        },
+    }
+    resp = requests.post(url, json=body, timeout=60)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    data = resp.json()
+    # 解析 candidates → parts → text
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+        texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
+        return "\n".join(t for t in texts if t)
+    except Exception:
+        return str(data)
 
 
+def call_xai(messages: List[ChatMessage], model: Optional[str], temperature: float, max_tokens: int) -> str:
+    if not XAI_API_KEY:
+        return "xAI API key 未配置（XAI_API_KEY）。"
+    url = "https://api.x.ai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": model or DEFAULT_XAI_MODEL,
+        "messages": [m.dict() for m in messages],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    data = resp.json()
+    try:
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        return str(data)
+
+
+# ------------ 统一入口 ------------
 @app.post("/chat")
-async def chat_endpoint(req: ChatRequest) -> JSONResponse:
-    """Chat endpoint that dispatches to the appropriate provider."""
-    # Validate messages list is non-empty
-    if not req.messages:
+def chat(req: ChatRequest):
+    """
+    请求示例：
+    {
+      "provider": "auto",
+      "messages": [
+        {"role":"system","content":"You are a helpful assistant."},
+        {"role":"user","content":"帮我写个SQL分组示例"}
+      ],
+      "temperature": 0.7,
+      "max_tokens": 800
+    }
+    """
+    provider = req.provider.lower().strip()
+    temperature = float(req.temperature or 0.7)
+    max_tokens = int(req.max_tokens or 1500)
+
+    if provider not in {"openai", "gemini", "xai", "auto"}:
+        raise HTTPException(status_code=400, detail="provider 必须是 openai | gemini | xai | auto")
+
+    # 自动路由
+    if provider == "auto":
+        provider = route_request(req.messages)
+
+    try:
+        if provider == "openai":
+            content = call_openai(req.messages, req.model, temperature, max_tokens)
+        elif provider == "gemini":
+            content = call_gemini(req.messages, req.model, temperature, max_tokens)
+        elif provider == "xai":
+            content = call_xai(req.messages, req.model, temperature, max_tokens)
+        else:
+            raise HTTPException(status_code=400, detail="未知 provider")
+        return {"provider": provider, "content": content}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
+
+
+# 本地调试：python main.py
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "3000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+
         raise HTTPException(status_code=400, detail="Messages list cannot be empty")
     # Call provider
     answer = route_request(req.provider, req.messages)
